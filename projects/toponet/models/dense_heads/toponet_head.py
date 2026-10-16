@@ -22,6 +22,8 @@ from mmdet.models.utils import build_transformer
 from mmdet.models.utils.transformer import inverse_sigmoid
 from mmdet3d.core.bbox.coders import build_bbox_coder
 
+from .topology_geometry_refinement_head import TopologyGeometryRefinementHead
+
 
 @HEADS.register_module()
 class TopoNetHead(AnchorFreeHead):
@@ -33,6 +35,7 @@ class TopoNetHead(AnchorFreeHead):
                  transformer=None,
                  lclc_head=None,
                  lcte_head=None,
+                 geometry_refinement_cfg=None,
                  bbox_coder=None,
                  num_reg_fcs=2,
                  code_weights=None,
@@ -85,6 +88,7 @@ class TopoNetHead(AnchorFreeHead):
         self.fp16_enabled = False
         self.loss_cls = build_loss(loss_cls)
         self.loss_bbox = build_loss(loss_bbox)
+        self.geometry_refinement_cfg = geometry_refinement_cfg
 
         if self.loss_cls.use_sigmoid:
             self.cls_out_channels = num_classes
@@ -127,6 +131,21 @@ class TopoNetHead(AnchorFreeHead):
         self.real_h = self.pc_range[4] - self.pc_range[1]
         self.num_reg_fcs = num_reg_fcs
         self._init_layers()
+        if geometry_refinement_cfg is not None:
+            cfg = geometry_refinement_cfg.copy()
+            self.geometry_refinement_loss_weights = cfg.pop(
+                'loss_weights', dict(reg=1.0, chamfer=0.1,
+                                     smooth=0.05, residual=0.01))
+            self.geometry_refinement_target_cfg = cfg.pop(
+                'target_cfg', dict(hard_distance=2.0, hard_weight=3.0))
+            cfg.setdefault('embed_dims', self.embed_dims)
+            cfg.setdefault('num_points', self.code_size // self.pts_dim)
+            self.geometry_refinement_head = TopologyGeometryRefinementHead(
+                **cfg)
+        else:
+            self.geometry_refinement_head = None
+            self.geometry_refinement_loss_weights = None
+            self.geometry_refinement_target_cfg = None
 
     def _init_layers(self):
         cls_branch = []
@@ -231,6 +250,18 @@ class TopoNetHead(AnchorFreeHead):
         outputs_classes = torch.stack(outputs_classes)
         outputs_coords = torch.stack(outputs_coords)
 
+        geometry_refinement = None
+        original_final_points = outputs_coords[-1].reshape(
+            outputs_coords.shape[1], self.num_query, -1, self.pts_dim)
+        if self.geometry_refinement_head is not None:
+            geometry_refinement = self.geometry_refinement_head(
+                hs[-1], original_final_points, lclc_rel_out[-1])
+            refined_final = geometry_refinement['lane_points'].reshape(
+                outputs_coords.shape[1], self.num_query, -1)
+            outputs_coords = torch.cat(
+                [outputs_coords[:-1], refined_final.unsqueeze(0)], dim=0)
+            geometry_refinement['original_lane_points'] = original_final_points
+
         outs = {
             'all_cls_scores': outputs_classes,
             'all_lanes_preds': outputs_coords,
@@ -238,6 +269,8 @@ class TopoNetHead(AnchorFreeHead):
             'all_lcte_preds': lcte_rel_out,
             'history_states': hs
         }
+        if geometry_refinement is not None:
+            outs['geometry_refinement'] = geometry_refinement
 
         return outs
 
@@ -388,6 +421,75 @@ class TopoNetHead(AnchorFreeHead):
             loss_bbox = torch.nan_to_num(loss_bbox)
         return loss_cls, loss_bbox, loss_lclc, loss_lcte
 
+    def loss_geometry_refinement(self, refinement, base_cls_scores,
+                                 gt_lanes_list, gt_labels_list):
+        """Train E5 from assignments made with the unrefined lane geometry."""
+        original = refinement['original_lane_points']
+        refined = refinement['lane_points']
+        pred_list, target_list, hard_list = [], [], []
+        hard_distance = self.geometry_refinement_target_cfg.get(
+            'hard_distance', 2.0)
+        hard_weight = self.geometry_refinement_target_cfg.get(
+            'hard_weight', 3.0)
+
+        for b in range(original.shape[0]):
+            original_flat = original[b].reshape(original.shape[1], -1)
+            assigned = self.assigner.assign(
+                original_flat, base_cls_scores[b], gt_lanes_list[b],
+                gt_labels_list[b], None)
+            positive = torch.nonzero(
+                assigned.gt_inds > 0, as_tuple=False).flatten()
+            if not len(positive):
+                continue
+            gt_indices = assigned.gt_inds[positive] - 1
+            target = gt_lanes_list[b][gt_indices].reshape(
+                len(positive), -1, self.pts_dim)
+            source = original[b, positive]
+            pred_list.append(refined[b, positive])
+            target_list.append(target)
+            hard_list.append(
+                torch.norm(source - target, dim=-1).mean(-1) > hard_distance)
+
+        weights = self.geometry_refinement_loss_weights
+        if pred_list:
+            pred_points = torch.cat(pred_list)
+            target_points = torch.cat(target_list)
+            hard = torch.cat(hard_list)
+            sample_weight = 1 + hard.to(pred_points.dtype) * (hard_weight - 1)
+            point_loss = F.smooth_l1_loss(
+                pred_points, target_points, reduction='none').mean((1, 2))
+            pair_distance = torch.cdist(pred_points, target_points, p=2)
+            chamfer = 0.5 * (
+                pair_distance.min(-1).values.mean(-1) +
+                pair_distance.min(-2).values.mean(-1))
+            losses = dict(
+                loss_geometry_refinement_reg=weights.get('reg', 1.0) *
+                (point_loss * sample_weight).sum() / sample_weight.sum(),
+                loss_geometry_refinement_chamfer=weights.get('chamfer', 0.0) *
+                (chamfer * sample_weight).sum() / sample_weight.sum(),
+                geometry_refinement_hard_fraction=hard.to(
+                    pred_points.dtype).mean().detach())
+        else:
+            zero = refined.sum() * 0
+            losses = dict(
+                loss_geometry_refinement_reg=zero,
+                loss_geometry_refinement_chamfer=zero,
+                geometry_refinement_hard_fraction=zero.detach())
+
+        residual = refinement['residual']
+        residual_delta = residual[:, :, 1:] - residual[:, :, :-1]
+        losses.update(
+            loss_geometry_refinement_smooth=weights.get('smooth', 0.0) *
+            residual_delta.abs().mean(),
+            loss_geometry_refinement_residual=weights.get('residual', 0.0) *
+            residual.abs().mean(),
+            geometry_refinement_gate_mean=refinement['gate'].mean().detach(),
+            geometry_refinement_graph_support=refinement[
+                'graph_support'].mean().detach(),
+            geometry_refinement_residual_mean=torch.norm(
+                residual, dim=-1).mean().detach())
+        return losses
+
     @force_fp32(apply_to=('preds_dicts'))
     def loss(self,
              preds_dicts,
@@ -439,6 +541,10 @@ class TopoNetHead(AnchorFreeHead):
             loss_dict[f'd{num_dec_layer}.loss_lclc_rel'] = loss_lclc_i
             loss_dict[f'd{num_dec_layer}.loss_lcte_rel'] = loss_lcte_i
             num_dec_layer += 1
+        if self.geometry_refinement_head is not None:
+            loss_dict.update(self.loss_geometry_refinement(
+                preds_dicts['geometry_refinement'], all_cls_scores[-1],
+                gt_lanes_list, gt_labels_list))
         return loss_dict
 
     @force_fp32(apply_to=('preds_dicts'))
