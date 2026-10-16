@@ -23,6 +23,7 @@ from mmdet.models.utils.transformer import inverse_sigmoid
 from mmdet3d.core.bbox.coders import build_bbox_coder
 
 from .topology_geometry_refinement_head import TopologyGeometryRefinementHead
+from .topology_bev_requery_head import TopologyBEVRequeryHead
 
 
 @HEADS.register_module()
@@ -36,6 +37,7 @@ class TopoNetHead(AnchorFreeHead):
                  lclc_head=None,
                  lcte_head=None,
                  geometry_refinement_cfg=None,
+                 bev_requery_cfg=None,
                  bbox_coder=None,
                  num_reg_fcs=2,
                  code_weights=None,
@@ -89,6 +91,7 @@ class TopoNetHead(AnchorFreeHead):
         self.loss_cls = build_loss(loss_cls)
         self.loss_bbox = build_loss(loss_bbox)
         self.geometry_refinement_cfg = geometry_refinement_cfg
+        self.bev_requery_cfg = bev_requery_cfg
 
         if self.loss_cls.use_sigmoid:
             self.cls_out_channels = num_classes
@@ -146,6 +149,20 @@ class TopoNetHead(AnchorFreeHead):
             self.geometry_refinement_head = None
             self.geometry_refinement_loss_weights = None
             self.geometry_refinement_target_cfg = None
+        if bev_requery_cfg is not None:
+            cfg = bev_requery_cfg.copy()
+            self.bev_requery_loss_weights = cfg.pop(
+                'loss_weights', dict(reg=1.0, chamfer=0.1,
+                                     smooth=0.05, residual=0.01))
+            self.bev_requery_target_cfg = cfg.pop(
+                'target_cfg', dict(hard_distance=2.0, hard_weight=3.0))
+            cfg.setdefault('embed_dims', self.embed_dims)
+            cfg.setdefault('num_points', self.code_size // self.pts_dim)
+            self.bev_requery_head = TopologyBEVRequeryHead(**cfg)
+        else:
+            self.bev_requery_head = None
+            self.bev_requery_loss_weights = None
+            self.bev_requery_target_cfg = None
 
     def _init_layers(self):
         cls_branch = []
@@ -271,6 +288,19 @@ class TopoNetHead(AnchorFreeHead):
         }
         if geometry_refinement is not None:
             outs['geometry_refinement'] = geometry_refinement
+
+        if self.bev_requery_head is not None:
+            requery_source = outputs_coords[-1].reshape(
+                outputs_coords.shape[1], self.num_query, -1, self.pts_dim)
+            bev_requery = self.bev_requery_head(
+                hs[-1], requery_source, lclc_rel_out[-1], bev_feats,
+                self.bev_h, self.bev_w, self.pc_range)
+            requery_final = bev_requery['lane_points'].reshape(
+                outputs_coords.shape[1], self.num_query, -1)
+            outputs_coords = torch.cat(
+                [outputs_coords[:-1], requery_final.unsqueeze(0)], dim=0)
+            outs['all_lanes_preds'] = outputs_coords
+            outs['bev_requery'] = bev_requery
 
         return outs
 
@@ -490,6 +520,77 @@ class TopoNetHead(AnchorFreeHead):
                 residual, dim=-1).mean().detach())
         return losses
 
+    def loss_bev_requery(self, requery, base_cls_scores,
+                         gt_lanes_list, gt_labels_list):
+        """Supervise the zero-initialized second-stage E9 correction."""
+        source = requery['original_lane_points']
+        refined = requery['lane_points']
+        pred_list, target_list, hard_list = [], [], []
+        hard_distance = self.bev_requery_target_cfg.get('hard_distance', 2.0)
+        hard_weight = self.bev_requery_target_cfg.get('hard_weight', 3.0)
+        for b in range(source.shape[0]):
+            assigned = self.assigner.assign(
+                source[b].reshape(source.shape[1], -1), base_cls_scores[b],
+                gt_lanes_list[b], gt_labels_list[b], None)
+            positive = torch.nonzero(
+                assigned.gt_inds > 0, as_tuple=False).flatten()
+            if not len(positive):
+                continue
+            gt_indices = assigned.gt_inds[positive] - 1
+            target = gt_lanes_list[b][gt_indices].reshape(
+                len(positive), -1, self.pts_dim)
+            source_positive = source[b, positive]
+            pred_list.append(refined[b, positive])
+            target_list.append(target)
+            hard_list.append(
+                torch.norm(source_positive - target, dim=-1).mean(-1) >
+                hard_distance)
+
+        weights = self.bev_requery_loss_weights
+        if pred_list:
+            pred = torch.cat(pred_list)
+            target = torch.cat(target_list)
+            hard = torch.cat(hard_list)
+            sample_weight = 1 + hard.to(pred.dtype) * (hard_weight - 1)
+            point_loss = F.smooth_l1_loss(
+                pred, target, reduction='none').mean((1, 2))
+            pair_distance = torch.cdist(pred, target, p=2)
+            chamfer = 0.5 * (
+                pair_distance.min(-1).values.mean(-1) +
+                pair_distance.min(-2).values.mean(-1))
+            losses = dict(
+                loss_bev_requery_reg=weights.get('reg', 1.0) *
+                (point_loss * sample_weight).sum() / sample_weight.sum(),
+                loss_bev_requery_chamfer=weights.get('chamfer', 0.0) *
+                (chamfer * sample_weight).sum() / sample_weight.sum(),
+                bev_requery_hard_fraction=hard.to(pred.dtype).mean().detach())
+        else:
+            zero = refined.sum() * 0
+            losses = dict(
+                loss_bev_requery_reg=zero,
+                loss_bev_requery_chamfer=zero,
+                bev_requery_hard_fraction=zero.detach())
+
+        residual = requery['residual']
+        residual_delta = residual[:, :, 1:] - residual[:, :, :-1]
+        learned_sampling = (
+            requery['sampling_offset'] -
+            self.bev_requery_head.fixed_offsets.to(requery['sampling_offset']))
+        losses.update(
+            loss_bev_requery_smooth=weights.get('smooth', 0.0) *
+            residual_delta.abs().mean(),
+            loss_bev_requery_residual=weights.get('residual', 0.0) *
+            residual.abs().mean(),
+            bev_requery_residual_mean=torch.norm(
+                residual, dim=-1).mean().detach(),
+            bev_requery_sampling_offset_mean=torch.norm(
+                learned_sampling, dim=-1).mean().detach(),
+            bev_requery_guided_offset_mean=torch.norm(
+                requery['guided_offset'], dim=-1).mean().detach(),
+            bev_requery_graph_support=requery[
+                'graph_support'].mean().detach())
+        return losses
+
     @force_fp32(apply_to=('preds_dicts'))
     def loss(self,
              preds_dicts,
@@ -544,6 +645,10 @@ class TopoNetHead(AnchorFreeHead):
         if self.geometry_refinement_head is not None:
             loss_dict.update(self.loss_geometry_refinement(
                 preds_dicts['geometry_refinement'], all_cls_scores[-1],
+                gt_lanes_list, gt_labels_list))
+        if self.bev_requery_head is not None:
+            loss_dict.update(self.loss_bev_requery(
+                preds_dicts['bev_requery'], all_cls_scores[-1],
                 gt_lanes_list, gt_labels_list))
         return loss_dict
 
