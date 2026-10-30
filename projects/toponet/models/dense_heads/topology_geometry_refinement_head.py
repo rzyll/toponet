@@ -14,12 +14,14 @@ class TopologyGeometryRefinementHead(nn.Module):
                  detach_inputs=True,
                  detach_graph=True,
                  graph_threshold=0.5,
+                 use_neighbor_features=True,
                  gate_bias=-2.0):
         super().__init__()
         self.num_points = num_points
         self.detach_inputs = detach_inputs
         self.detach_graph = detach_graph
         self.graph_threshold = graph_threshold
+        self.use_neighbor_features = use_neighbor_features
         self.register_buffer(
             'residual_scale', torch.tensor(residual_scale).view(1, 1, 1, 3))
 
@@ -57,6 +59,9 @@ class TopologyGeometryRefinementHead(nn.Module):
         in_degree = incoming.sum(-1, keepdim=True)
         out_context = torch.bmm(adjacency, lane_feats) / (out_degree + 1e-6)
         in_context = torch.bmm(incoming, lane_feats) / (in_degree + 1e-6)
+        if not self.use_neighbor_features:
+            out_context = torch.zeros_like(out_context)
+            in_context = torch.zeros_like(in_context)
 
         start = lane_points[:, :, 0]
         end = lane_points[:, :, -1]
